@@ -21,3 +21,8 @@ Desktop.ini
 # Logs and backups
 *.log
 *.bak
+
+# Dependencies and tool caches (not used by the plugin, may be created locally)
+/vendor/
+/node_modules/
+.phpcs-cache
