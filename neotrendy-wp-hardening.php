@@ -2,8 +2,8 @@
 /**
  * Plugin Name:       Neotrendy WP Hardening
  * Plugin URI:        https://github.com/neotrendy/neotrendy-wp-hardening
- * Description:       Small, readable, secure defaults: blocks user enumeration, disables XML-RPC and application passwords, hides users from the sitemap, saves image sub-sizes as WebP and adds Site Health checks. No settings screen.
- * Version:           0.1.0
+ * Description:       Small, readable, secure defaults: blocks user enumeration, disables XML-RPC and application passwords, hides users from the sitemap, saves uploaded images as WebP and adds Site Health checks. No settings screen.
+ * Version:           0.1.1
  * Requires at least: 6.5
  * Requires PHP:      8.1
  * Author:            Neotrendy s. r. o.
@@ -23,7 +23,7 @@ if ( defined( 'NWPH_VERSION' ) ) {
 	return;
 }
 
-define( 'NWPH_VERSION', '0.1.0' );
+define( 'NWPH_VERSION', '0.1.1' );
 
 // Must-use plugins are loaded before the "muplugins_loaded" action fires.
 define( 'NWPH_IS_MU_PLUGIN', ! did_action( 'muplugins_loaded' ) );
@@ -276,7 +276,8 @@ add_filter( 'wp_sitemaps_taxonomies', 'nwph_sitemap_exclude_taxonomies' );
  */
 
 /**
- * Saves JPEG and PNG sub-sizes as WebP when the image editor supports it. The original upload is kept.
+ * Saves JPEG and PNG images (full size and sub-sizes) as WebP when the image editor supports it.
+ * The uploaded file is kept as the original image.
  *
  * @param array<string, string> $formats Source MIME type => output MIME type.
  * @return array<string, string>
@@ -287,7 +288,8 @@ function nwph_webp_output_format( $formats ) {
 	}
 
 	foreach ( array( 'image/jpeg', 'image/png' ) as $mime_type ) {
-		if ( ! isset( $formats[ $mime_type ] ) ) {
+		// The REST API (client-side media processing) passes an identity mapping, treat it as "not set".
+		if ( ! isset( $formats[ $mime_type ] ) || $formats[ $mime_type ] === $mime_type ) {
 			$formats[ $mime_type ] = 'image/webp';
 		}
 	}

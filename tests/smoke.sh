@@ -8,6 +8,8 @@
 #
 # The plugin must already be loaded (mu-plugin or active plugin). wp-config.php is backed up and
 # restored on exit; temporary users, a post and an attachment are created and deleted.
+# HTTP checks of xmlrpc.php are skipped (SKIP) when the web server blocks it (403/404); the same
+# behaviour is then verified in PHP only.
 
 set -uo pipefail
 
@@ -18,11 +20,13 @@ CONFIG_DELAY="${CONFIG_DELAY:-3}"
 
 PASSES=0
 FAILS=0
+SKIPS=0
 
 wpc() { wp --path="$WP_PATH" "$@"; }
 
 pass() { echo "PASS  $*"; PASSES=$((PASSES + 1)); }
 fail() { echo "FAIL  $*"; FAILS=$((FAILS + 1)); }
+skip() { echo "SKIP  $*"; SKIPS=$((SKIPS + 1)); }
 
 check() { # description expected actual
 	if [[ "$3" == "$2" ]]; then pass "$1"; else fail "$1 (expected '$2', got '$3')"; fi
@@ -114,8 +118,27 @@ xmlrpc_call() { # method
 	curl -s -H 'Content-Type: text/xml' --data "<?xml version=\"1.0\"?><methodCall><methodName>$1</methodName><params></params></methodCall>" "$SITE_URL/xmlrpc.php"
 }
 
-# Method names from system.listMethods, excluding the system.* methods built into the IXR server.
-xmlrpc_methods() { xmlrpc_call system.listMethods | grep -o '<string>[^<]*</string>' | sed 's/<[^>]*>//g' | grep -v '^system\.' | tr '\n' ' '; }
+xmlrpc_http_status() { http_code -H 'Content-Type: text/xml' --data '<?xml version="1.0"?><methodCall><methodName>system.listMethods</methodName><params></params></methodCall>' "$SITE_URL/xmlrpc.php"; }
+
+# Method names from system.listMethods over HTTP, excluding the system.* methods built into the
+# IXR server. Prints "invalid-response" unless the server sent an XML-RPC method response.
+xmlrpc_methods() {
+	local body
+	body="$(xmlrpc_call system.listMethods)"
+	if [[ "$body" != *"<methodResponse>"* ]]; then echo "invalid-response"; return; fi
+	grep -o '<string>[^<]*</string>' <<< "$body" | sed 's/<[^>]*>//g' | grep -v '^system\.' | tr '\n' ' '
+}
+
+# The same list computed in PHP from the server class xmlrpc.php would use.
+xmlrpc_methods_php() {
+	wp_eval '
+		require_once ABSPATH . WPINC . "/class-IXR.php";
+		require_once ABSPATH . WPINC . "/class-wp-xmlrpc-server.php";
+		$server = new wp_xmlrpc_server();
+		echo "RESULT:" . implode( " ", array_filter( array_keys( $server->methods ), fn( $m ) => ! str_starts_with( $m, "system." ) ) );'
+}
+
+xmlrpc_enabled_php() { wp_eval 'echo "RESULT:" . var_export( (bool) apply_filters( "xmlrpc_enabled", true ), true );'; }
 
 login_error() { # username
 	curl -s -b 'wordpress_test_cookie=WP%20Cookie%20check' --data-urlencode "log=$1" --data-urlencode 'pwd=nwph-wrong-password' \
@@ -133,6 +156,19 @@ subsize_mimes() { # attachment ID
 
 original_mime() { # attachment ID
 	wp_eval 'echo "RESULT:" . wp_check_filetype( wp_get_original_image_path( (int) nwph_arg( 0 ) ) )["type"];' "$1"
+}
+
+full_size_mime() { # attachment ID -> MIME type of the file used as the full size
+	wp_eval 'echo "RESULT:" . wp_check_filetype( get_attached_file( (int) nwph_arg( 0 ) ) )["type"];' "$1"
+}
+
+# REST field the block editor reads to choose the output format for client-side processing.
+rest_output_format() { # attachment ID
+	wp_eval --user="$ADMIN_ID" '
+		$r = new WP_REST_Request( "GET", "/wp/v2/media/" . nwph_arg( 0 ) );
+		$r->set_query_params( array( "context" => "edit", "_fields" => "image_output_format" ) );
+		$d = rest_do_request( $r )->get_data();
+		echo "RESULT:" . ( array_key_exists( "image_output_format", (array) $d ) ? var_export( $d["image_output_format"], true ) : "missing" );' "$1"
 }
 
 site_health() { # test id -> status, or "missing"
@@ -172,8 +208,15 @@ ERR_KNOWN="$(login_error "$(wpc user get "$ADMIN_ID" --field=user_login)")"
 check_contains "wp-login.php shows generic error" 'password is incorrect' "$ERR_UNKNOWN"
 check "wp-login.php error identical for unknown and existing user" "$ERR_UNKNOWN" "$ERR_KNOWN"
 
-check "XML-RPC system.listMethods without WordPress methods" "" "$(xmlrpc_methods)"
-check_contains "XML-RPC wp.getUsersBlogs -> fault" 'faultCode' "$(xmlrpc_call wp.getUsersBlogs)"
+check "XML-RPC disabled (xmlrpc_enabled filter)" false "$(xmlrpc_enabled_php)"
+check "XML-RPC server class without WordPress methods" "" "$(xmlrpc_methods_php)"
+XMLRPC_STATUS="$(xmlrpc_http_status)"
+if [[ "$XMLRPC_STATUS" == 403 || "$XMLRPC_STATUS" == 404 ]]; then
+	skip "XML-RPC HTTP checks: xmlrpc.php is blocked by the web server (HTTP $XMLRPC_STATUS)"
+else
+	check "XML-RPC system.listMethods over HTTP without WordPress methods" "" "$(xmlrpc_methods)"
+	check_contains "XML-RPC wp.getUsersBlogs -> fault" 'faultCode' "$(xmlrpc_call wp.getUsersBlogs)"
+fi
 check_absent "X-Pingback header absent" 'x-pingback' "$(curl -sI "$POST_URL" | tr 'A-Z' 'a-z')"
 check_absent "RSD link absent" 'EditURI' "$(curl -s "$SITE_URL/")"
 
@@ -191,7 +234,9 @@ check "nwph_sitemap_excluded_taxonomies removes category" excluded \
 if [[ "$(wp_eval 'echo "RESULT:" . ( wp_image_editor_supports( array( "mime_type" => "image/webp" ) ) ? "yes" : "no" );')" == "yes" ]]; then
 	ATTACHMENT_ID="$(import_test_image)"
 	check "JPEG upload: sub-sizes are WebP" image/webp "$(subsize_mimes "$ATTACHMENT_ID")"
+	check "JPEG upload: full size is WebP" image/webp "$(full_size_mime "$ATTACHMENT_ID")"
 	check "JPEG upload: original kept as JPEG" image/jpeg "$(original_mime "$ATTACHMENT_ID")"
+	check "REST image_output_format for the block editor -> image/webp" "'image/webp'" "$(rest_output_format "$ATTACHMENT_ID")"
 	wpc post delete "$ATTACHMENT_ID" --force --quiet
 else
 	fail "Image editor does not support WebP on this server, WebP test skipped"
@@ -259,7 +304,14 @@ check_contains "oEmbed with author_name" 'author_name' "$(curl -s -G --data-urle
 check "wp_authenticate unknown user -> core error" invalid_username \
 	"$(wp_eval 'echo "RESULT:" . wp_authenticate( "nwph-no-such-user", "x" )->get_error_code();')"
 
-check_contains "XML-RPC system.listMethods lists WordPress methods" 'wp.getUsersBlogs' "$(xmlrpc_methods)"
+check "XML-RPC enabled (xmlrpc_enabled filter)" true "$(xmlrpc_enabled_php)"
+check_contains "XML-RPC server class lists WordPress methods" 'wp.getUsersBlogs' "$(xmlrpc_methods_php)"
+XMLRPC_STATUS="$(xmlrpc_http_status)"
+if [[ "$XMLRPC_STATUS" == 403 || "$XMLRPC_STATUS" == 404 ]]; then
+	skip "XML-RPC HTTP checks: xmlrpc.php is blocked by the web server (HTTP $XMLRPC_STATUS)"
+else
+	check_contains "XML-RPC system.listMethods over HTTP lists WordPress methods" 'wp.getUsersBlogs' "$(xmlrpc_methods)"
+fi
 check_contains "X-Pingback header present" 'x-pingback' "$(curl -sI "$POST_URL" | tr 'A-Z' 'a-z')"
 check_contains "RSD link present" 'EditURI' "$(curl -s "$SITE_URL/")"
 
@@ -271,6 +323,8 @@ check "Users sitemap -> 200" 200 "$(http_code "$SITE_URL/wp-sitemap-users-1.xml"
 
 ATTACHMENT_ID="$(import_test_image)"
 check "JPEG upload: sub-sizes stay JPEG" image/jpeg "$(subsize_mimes "$ATTACHMENT_ID")"
+check "JPEG upload: full size stays JPEG" image/jpeg "$(full_size_mime "$ATTACHMENT_ID")"
+check "REST image_output_format for the block editor -> null" NULL "$(rest_output_format "$ATTACHMENT_ID")"
 wpc post delete "$ATTACHMENT_ID" --force --quiet
 
 for t in "${SH_TESTS[@]}"; do
@@ -280,5 +334,5 @@ done
 # --- Summary -----------------------------------------------------------------
 
 echo
-echo "Passed: $PASSES  Failed: $FAILS"
+echo "Passed: $PASSES  Failed: $FAILS  Skipped: $SKIPS"
 [[ "$FAILS" -eq 0 ]] && exit 0 || exit 1

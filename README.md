@@ -34,14 +34,25 @@ or with a filter of the same name. **The constant takes precedence over the filt
 4. **Hides users from the core sitemap** – the `users` sitemap provider is removed. Taxonomies
    can be removed with the `nwph_sitemap_excluded_taxonomies` filter (empty by default; it works
    independently of the constant).
-5. **WebP for uploaded images** – JPEG and PNG sub-sizes (thumbnails, medium, large, …) are
-   saved as WebP, but only if the server's image editor (Imagick or GD) supports WebP. **The
-   original uploaded file is kept unchanged**; WordPress still records it as the original
-   image. If the upload is larger than the "big image" threshold (2560 px by default), the
-   scaled copy that WordPress uses as the full size is WebP as well. Images edited in the media
+5. **WebP for uploaded images** – new JPEG and PNG uploads are saved as WebP, but only if the
+   server's image editor (Imagick or GD) supports WebP:
+   - **the uploaded file stays on disk unchanged** and WordPress records it as the original
+     image (`original_image` in the attachment metadata, `wp_get_original_image_path()`);
+   - **the full size is WebP too**, because WordPress converts it whenever the output format
+     differs (`photo.jpg` → `photo.webp`; above the "big image" threshold of 2560 px the
+     scaled copy `photo-scaled.webp`). Posts and the media library use this WebP file;
+   - all sub-sizes (thumbnail, medium, large, …) are WebP;
+   - the attachment's MIME type (`post_mime_type`) stays `image/jpeg` or `image/png`; this is
+     how WordPress core records converted images, plugins that filter attachments by MIME type
+     still see the original type.
+
+   Uploads processed in the browser by the block editor (WordPress 7.1+, client-side media
+   processing on HTTPS and `localhost`) use the same setting: WordPress tells the editor the
+   output format through the REST field `image_output_format`. Images edited in the media
    library (crop, rotate) are also saved as WebP. Images uploaded before activation are not
-   converted. Uploads processed in the browser by the block editor follow the same setting,
-   because WordPress passes the output format to the editor.
+   converted. A mapping to another format set by another plugin (for example AVIF) is kept;
+   an identity mapping (`image/jpeg => image/jpeg`) is treated as "not set", so use
+   `NWPH_WEBP_UPLOADS` or the `nwph_webp_uploads` filter to turn the conversion off.
 6. **Site Health checks** – informational only, they change nothing. Under
    *Tools → Site Health* (category *Security*):
    - `DISALLOW_FILE_EDIT` is enabled;
@@ -109,7 +120,7 @@ constant is not defined, for example `add_filter( 'nwph_disable_xmlrpc', '__retu
 | `NWPH_DISABLE_XMLRPC` | `nwph_disable_xmlrpc` | `true` | XML-RPC off | **Jetpack** (connection and several modules use XML-RPC), the **WordPress mobile app** on sites without application passwords, old desktop blogging clients, incoming pingbacks/trackbacks via XML-RPC, some remote management services. |
 | `NWPH_DISABLE_APPLICATION_PASSWORDS` | `nwph_disable_application_passwords` | `true` | Application passwords off | The **WordPress mobile app** (logs in with application passwords), **REST API integrations** that authenticate with application passwords (automation services, CI, headless sites, some backup and management tools). |
 | `NWPH_SITEMAP_HIDE_USERS` | `nwph_sitemap_hide_users` | `true` | No users in `/wp-sitemap.xml` | None known; SEO plugins with their own sitemap are not affected. |
-| `NWPH_WEBP_UPLOADS` | `nwph_webp_uploads` | `true` | WebP sub-sizes | Image or CDN plugins that do their own conversion (they may override or duplicate it); workflows that require JPEG sub-sizes. |
+| `NWPH_WEBP_UPLOADS` | `nwph_webp_uploads` | `true` | WebP for new uploads (full size and sub-sizes) | Image or CDN plugins that do their own conversion (they may override or duplicate it); workflows that require JPEG files. |
 | `NWPH_SITE_HEALTH_CHECKS` | `nwph_site_health_checks` | `true` | Site Health checks | None known. |
 | – | `nwph_sitemap_excluded_taxonomies` | `array()` | Taxonomy names to remove from the core sitemap | – |
 
