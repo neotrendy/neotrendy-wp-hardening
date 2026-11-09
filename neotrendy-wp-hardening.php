@@ -2,8 +2,8 @@
 /**
  * Plugin Name:       Neotrendy WP Hardening
  * Plugin URI:        https://github.com/neotrendy/neotrendy-wp-hardening
- * Description:       Small, readable, secure defaults: blocks user enumeration, disables XML-RPC and application passwords, hides users from the sitemap, saves uploaded images as WebP and adds Site Health checks. No settings screen.
- * Version:           0.1.1
+ * Description:       Small, readable, secure defaults: blocks user enumeration, disables XML-RPC and application passwords, hides users from the sitemap, saves uploaded images as WebP without metadata and adds Site Health checks. No settings screen.
+ * Version:           0.2.0
  * Requires at least: 6.5
  * Requires PHP:      8.1
  * Author:            Neotrendy s. r. o.
@@ -23,7 +23,7 @@ if ( defined( 'NWPH_VERSION' ) ) {
 	return;
 }
 
-define( 'NWPH_VERSION', '0.1.1' );
+define( 'NWPH_VERSION', '0.2.0' );
 
 // Must-use plugins are loaded before the "muplugins_loaded" action fires.
 define( 'NWPH_IS_MU_PLUGIN', ! did_action( 'muplugins_loaded' ) );
@@ -45,6 +45,7 @@ function nwph_feature_keys(): array {
 		'sitemap_hide_users',
 		'webp_uploads',
 		'site_health_checks',
+		'strip_image_metadata',
 	);
 }
 
@@ -515,7 +516,8 @@ function nwph_test_hardening_features(): array {
 		'disable_xmlrpc'                => __( 'Disable XML-RPC', 'neotrendy-wp-hardening' ),
 		'disable_application_passwords' => __( 'Disable application passwords', 'neotrendy-wp-hardening' ),
 		'sitemap_hide_users'            => __( 'Hide users from the sitemap', 'neotrendy-wp-hardening' ),
-		'webp_uploads'                  => __( 'WebP sub-sizes for uploaded images', 'neotrendy-wp-hardening' ),
+		'webp_uploads'                  => __( 'WebP for uploaded images', 'neotrendy-wp-hardening' ),
+		'strip_image_metadata'          => __( 'Remove metadata (EXIF, GPS, XMP, IPTC) from uploaded images', 'neotrendy-wp-hardening' ),
 	);
 
 	$list     = '';
@@ -529,6 +531,10 @@ function nwph_test_hardening_features(): array {
 		if ( ! $enabled ) {
 			$disabled[] = "define( 'NWPH_" . strtoupper( $key ) . "', true ); // Or remove the line that sets it to false.";
 		}
+	}
+
+	if ( nwph_is_enabled( 'strip_image_metadata' ) && ! extension_loaded( 'gd' ) ) {
+		$list .= '<li>' . esc_html__( 'The PHP GD extension is not available, so metadata is not removed from uploaded images.', 'neotrendy-wp-hardening' ) . '</li>';
 	}
 
 	if ( nwph_is_enabled( 'webp_uploads' ) && ! wp_image_editor_supports( array( 'mime_type' => 'image/webp' ) ) ) {
@@ -546,3 +552,55 @@ function nwph_test_hardening_features(): array {
 		'<ul>' . $list . '</ul>'
 	);
 }
+
+/*
+ * 7. Image metadata.
+ */
+
+/**
+ * Removes EXIF (including GPS), XMP and IPTC metadata from an uploaded image by re-saving it with GD.
+ * The EXIF orientation is applied first. On failure the file is left unchanged.
+ *
+ * @param array $upload Upload data: file, url, type.
+ */
+function nwph_strip_image_metadata( $upload ) {
+	$types = (array) apply_filters( 'nwph_strip_image_metadata_types', array( 'image/jpeg', 'image/png', 'image/webp' ) );
+
+	if ( empty( $upload['file'] ) || ! in_array( $upload['type'] ?? '', $types, true ) || ! nwph_is_enabled( 'strip_image_metadata' ) ) {
+		return $upload;
+	}
+
+	$gd_only = static fn() => array( 'WP_Image_Editor_GD' );
+	add_filter( 'wp_image_editors', $gd_only, PHP_INT_MAX );
+	add_filter( 'image_editor_output_format', '__return_empty_array', PHP_INT_MAX );
+
+	$editor = wp_get_image_editor( $upload['file'] );
+	$result = is_wp_error( $editor ) ? $editor : $editor->maybe_exif_rotate();
+
+	if ( ! is_wp_error( $result ) ) {
+		$editor->set_quality( 90 );
+		$result = $editor->save( $upload['file'], $upload['type'] );
+	}
+
+	remove_filter( 'wp_image_editors', $gd_only, PHP_INT_MAX );
+	remove_filter( 'image_editor_output_format', '__return_empty_array', PHP_INT_MAX );
+
+	if ( is_wp_error( $result ) ) {
+		// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log -- One line, no file name or user data.
+		error_log( sprintf( 'Neotrendy WP Hardening: image metadata not removed (%s, %s).', $upload['type'], $result->get_error_code() ) );
+	}
+
+	return $upload;
+}
+add_filter( 'wp_handle_upload', 'nwph_strip_image_metadata' );
+
+/**
+ * Processes uploads on the server, where metadata is removed. In WordPress 7.1+ the block editor can
+ * otherwise process images in the browser and send copies that still contain metadata.
+ *
+ * @param bool $enabled Whether client-side media processing is enabled.
+ */
+function nwph_disable_client_side_media_processing( $enabled ) {
+	return nwph_is_enabled( 'strip_image_metadata' ) ? false : $enabled;
+}
+add_filter( 'wp_client_side_media_processing_enabled', 'nwph_disable_client_side_media_processing' );

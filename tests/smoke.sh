@@ -6,6 +6,7 @@
 # Environment: SITE_URL (default http://wordpress.localhost), WP_PATH (default /srv/wordpress.localhost),
 #              CONFIG_DELAY seconds to wait after editing wp-config.php so OPcache picks it up (default 3).
 #
+# Image fixtures with metadata are in tests/fixtures (see generate.php); tests/metadata.php inspects files.
 # The plugin must already be loaded (mu-plugin or active plugin). wp-config.php is backed up and
 # restored on exit; temporary users, a post and an attachment are created and deleted.
 # HTTP checks of xmlrpc.php are skipped (SKIP) when the web server blocks it (403/404); the same
@@ -15,6 +16,7 @@ set -uo pipefail
 
 SITE_URL="${SITE_URL:-http://wordpress.localhost}"
 SITE_URL="${SITE_URL%/}"
+TESTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WP_PATH="${WP_PATH:-/srv/wordpress.localhost}"
 CONFIG_DELAY="${CONFIG_DELAY:-3}"
 
@@ -61,7 +63,7 @@ set_const() { wpc config set "$1" "$2" --raw --type=constant --quiet; }
 set_const_str() { wpc config set "$1" "$2" --type=constant --quiet; }
 del_const() { wpc config has "$1" --type=constant 2>/dev/null && wpc config delete "$1" --type=constant --quiet; return 0; }
 
-FEATURES=(BLOCK_USER_ENUMERATION DISABLE_XMLRPC DISABLE_APPLICATION_PASSWORDS SITEMAP_HIDE_USERS WEBP_UPLOADS SITE_HEALTH_CHECKS)
+FEATURES=(BLOCK_USER_ENUMERATION DISABLE_XMLRPC DISABLE_APPLICATION_PASSWORDS SITEMAP_HIDE_USERS WEBP_UPLOADS SITE_HEALTH_CHECKS STRIP_IMAGE_METADATA)
 
 all_features() { # true|false
 	local f
@@ -84,6 +86,7 @@ POST_ID=""
 
 cleanup() {
 	[[ -n "$POST_ID" ]] && wpc post delete "$POST_ID" --force --quiet
+	[[ -s "$TMP_DIR/attachments" ]] && xargs wp --path="$WP_PATH" post delete --force --quiet < "$TMP_DIR/attachments"
 	[[ -n "$EDITOR_ID" ]] && wpc user delete "$EDITOR_ID" --yes --quiet
 	[[ -n "$SUBSCRIBER_ID" ]] && wpc user delete "$SUBSCRIBER_ID" --yes --quiet
 	cat "$TMP_DIR/wp-config.php.bak" > "$CONFIG_FILE"
@@ -178,6 +181,59 @@ site_health() { # test id -> status, or "missing"
 		echo "RESULT:" . ( $t ? call_user_func( $t["test"] )["status"] : "missing" );' "$1"
 }
 
+# All files of an attachment on disk: main file, original_image and sub-sizes, one per line.
+attachment_files() { # attachment ID
+	wp_eval '
+		$id  = (int) nwph_arg( 0 );
+		$f   = get_attached_file( $id );
+		$m   = wp_get_attachment_metadata( $id );
+		$out = array( $f, wp_get_original_image_path( $id ) );
+		foreach ( $m["sizes"] ?? array() as $s ) { $out[] = dirname( $f ) . "/" . $s["file"]; }
+		echo "RESULT:" . implode( "|", array_unique( array_filter( $out ) ) );' "$1" | tr '|' '\n'
+}
+
+media_import() { # fixture -> attachment ID
+	local id
+	id="$(wpc media import "$1" --porcelain 2>/dev/null)"
+	echo "$id" >> "$TMP_DIR/attachments" # Deleted on exit; this runs in a subshell.
+	echo "$id"
+}
+
+rest_upload() { # fixture -> attachment ID, uploaded with rest_do_request() as the administrator
+	local id
+	id="$(wp_eval --user="$ADMIN_ID" '
+		$p = nwph_arg( 0 );
+		$r = new WP_REST_Request( "POST", "/wp/v2/media" );
+		$r->set_header( "Content-Type", wp_check_filetype( $p )["type"] );
+		$r->set_header( "Content-Disposition", "attachment; filename=" . basename( $p ) );
+		$r->set_body( file_get_contents( $p ) );
+		echo "RESULT:" . ( rest_do_request( $r )->get_data()["id"] ?? "" );' "$1")"
+	echo "$id" >> "$TMP_DIR/attachments" # Deleted on exit; this runs in a subshell.
+	echo "$id"
+}
+
+# Passes when every file of the attachment has no metadata (tests/metadata.php prints "none").
+check_files_clean() { # description attachment-ID
+	local files report
+	mapfile -t files < <(attachment_files "$2")
+	report="$(php "$TESTS_DIR/metadata.php" "${files[@]}" 2>&1)"
+	if [[ ${#files[@]} -gt 0 ]] && ! grep -qv ' none$' <<< "$report"; then
+		pass "$1 (${#files[@]} files)"
+	else
+		fail "$1: $(tr '\n' ';' <<< "$report")"
+	fi
+}
+
+file_info() { # attachment-ID original|main -> "<width>x<height> <metadata>"
+	local path
+	path="$(wp_eval 'echo "RESULT:" . ( "original" === nwph_arg( 1 ) ? wp_get_original_image_path( (int) nwph_arg( 0 ) ) : get_attached_file( (int) nwph_arg( 0 ) ) );' "$1" "$2")"
+	php "$TESTS_DIR/metadata.php" "$path" | cut -d ' ' -f 2-
+}
+
+client_side_processing() {
+	wp_eval '$_SERVER["HTTP_HOST"] = "wordpress.localhost"; echo "RESULT:" . ( function_exists( "wp_is_client_side_media_processing_enabled" ) ? var_export( wp_is_client_side_media_processing_enabled(), true ) : "unsupported" );'
+}
+
 SH_TESTS=(nwph_disallow_file_edit nwph_debug_display nwph_debug_log nwph_force_ssl_admin nwph_environment_type nwph_hardening_features)
 
 # --- Features enabled --------------------------------------------------------
@@ -240,6 +296,35 @@ if [[ "$(wp_eval 'echo "RESULT:" . ( wp_image_editor_supports( array( "mime_type
 	wpc post delete "$ATTACHMENT_ID" --force --quiet
 else
 	fail "Image editor does not support WebP on this server, WebP test skipped"
+fi
+
+FIXTURES="$TESTS_DIR/fixtures"
+for f in gps.jpg gps.png gps.webp; do
+	check_files_clean "Metadata removed, wp media import $f" "$(media_import "$FIXTURES/$f")"
+	check_files_clean "Metadata removed, REST upload $f" "$(rest_upload "$FIXTURES/$f")"
+done
+ID="$(media_import "$FIXTURES/gps.jpg")"
+check "JPEG orientation applied: original rotated (fixture 400x200)" "200x400 none" "$(file_info "$ID" original)"
+check "JPEG orientation applied: full size rotated" "200x400 none" "$(file_info "$ID" main)"
+ID="$(rest_upload "$FIXTURES/gps.jpg")"
+check "JPEG orientation applied: REST upload rotated" "200x400 none" "$(file_info "$ID" original)"
+
+cp "$FIXTURES/gps.jpg" "$TMP_DIR/broken.jpg"
+truncate -s 200 "$TMP_DIR/broken.jpg"
+BROKEN_HASH="$(md5sum < "$TMP_DIR/broken.jpg")"
+# stderr is kept here: error_log() writes to it in WP-CLI.
+BROKEN_LOG="$(NWPH_BROKEN="$TMP_DIR/broken.jpg" wpc eval '
+	$u = nwph_strip_image_metadata( array( "file" => getenv( "NWPH_BROKEN" ), "url" => "", "type" => "image/jpeg" ) );
+	echo $u["file"] === getenv( "NWPH_BROKEN" ) ? "returned" : "lost";' 2>&1 | tr '\n' ' ')"
+check "Unreadable image: file left unchanged" "$BROKEN_HASH" "$(md5sum < "$TMP_DIR/broken.jpg")"
+check_contains "Unreadable image: upload continues" 'returned' "$BROKEN_LOG"
+check_contains "Unreadable image: one error_log line" 'image metadata not removed (image/jpeg' "$BROKEN_LOG"
+check_absent "Unreadable image: log without file name" 'broken' "$BROKEN_LOG"
+
+if [[ "$(client_side_processing)" == unsupported ]]; then
+	skip "Client-side media processing: not available in this WordPress version"
+else
+	check "Client-side media processing disabled" false "$(client_side_processing)"
 fi
 
 for t in "${SH_TESTS[@]}"; do
@@ -326,6 +411,15 @@ check "JPEG upload: sub-sizes stay JPEG" image/jpeg "$(subsize_mimes "$ATTACHMEN
 check "JPEG upload: full size stays JPEG" image/jpeg "$(full_size_mime "$ATTACHMENT_ID")"
 check "REST image_output_format for the block editor -> null" NULL "$(rest_output_format "$ATTACHMENT_ID")"
 wpc post delete "$ATTACHMENT_ID" --force --quiet
+
+INFO="$(file_info "$(media_import "$TESTS_DIR/fixtures/gps.jpg")" original)"
+check_contains "Metadata kept when disabled: original has EXIF" exif "$INFO"
+check_contains "Metadata kept when disabled: original has GPS" gps "$INFO"
+INFO="$(file_info "$(rest_upload "$TESTS_DIR/fixtures/gps.png")" original)"
+check_contains "Metadata kept when disabled: REST PNG original has GPS" gps "$INFO"
+if [[ "$(client_side_processing)" != unsupported ]]; then
+	check "Client-side media processing back to core default" true "$(client_side_processing)"
+fi
 
 for t in "${SH_TESTS[@]}"; do
 	check "Site Health test $t not registered" missing "$(site_health "$t")"
